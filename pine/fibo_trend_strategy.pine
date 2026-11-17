@@ -1,30 +1,31 @@
 // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
-// Fibo Trend Strategy v2 — rules as explained by the strategy author
+// Fibo Trend Strategy v3
 //
-//   Fib is drawn on the 15m timeframe (configurable):
-//     1    = reversal candle (the rectangle / broken zone)
-//     0    = end of the move away from the reversal candle
-//   Entry  : candle CLOSES below 0.5 (bearish) / above 0.5 (bullish) after price pulls back to it
-//   Stop   : candle CLOSES above 0.65 (bearish) / below 0.65 (bullish)
-//   TP1  0    = take out capital (partial close + stop to breakeven)
-//   TP2 -0.6  = second target
+//   Fib is drawn on the LEG THAT ENDS AT THE REVERSAL CANDLE (fib timeframe, default 15m):
+//     0  = previous swing (the high before a drop / the low before a rally)
+//     1  = reversal candle (the extreme of the drop / rally)
+//   Entry  : price turns and a candle CLOSES back beyond 0.5 (above for longs, below for shorts)
+//   Stop   : a candle CLOSES back beyond 0.65
+//   TP1  0    = previous swing, take out capital (partial close + stop to breakeven)
+//   TP2 -0.6
 //   TP3 -1.1  = golden target, close everything
-//   -1.6 / -1.9 are drawn for reference only.
+//   -1.6 / -1.9 drawn for reference.
 //
 //@version=6
-strategy("Fibo Trend Strategy v2", shorttitle = "FiboTrend", overlay = true,
+strategy("Fibo Trend Strategy v3", shorttitle = "FiboTrend", overlay = true,
      initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10,
-     pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0.01,
-     slippage = 1, max_lines_count = 100, max_labels_count = 100, max_boxes_count = 50)
+     pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0.05,
+     slippage = 2, max_lines_count = 100, max_labels_count = 100, max_boxes_count = 50)
 
 // ───────────────────────────── Inputs ─────────────────────────────
-grpS = "Fib swing (reversal candle)"
-fibTf      = input.timeframe("15", "Fib timeframe", group = grpS)
-pivLen     = input.int(3, "Pivot length (bars each side, on fib TF)", minval = 1, group = grpS)
-anchor1    = input.string("Zone edge", "Level 1 anchor", options = ["Zone edge", "Candle wick"], group = grpS,
-     tooltip = "Zone edge: level 1 = the side of the reversal candle that gets broken (bottom of the rectangle in a down move).\nCandle wick: level 1 = the extreme of the reversal candle.")
-minLegPct  = input.float(0.03, "Min leg size (%)", minval = 0.0, step = 0.01, group = grpS)
-expiryBars = input.int(60, "Setup expiry (chart bars)", minval = 5, group = grpS)
+grpS = "Fib leg"
+fibTf     = input.timeframe("15", "Fib timeframe", group = grpS)
+pivLen    = input.int(5, "Swing pivot length (bars each side, fib TF)", minval = 2, group = grpS,
+     tooltip = "Used to find the previous swing (level 0).")
+anchor1   = input.string("Candle wick", "Level 1 anchor", options = ["Candle wick", "Candle body edge"], group = grpS,
+     tooltip = "Candle wick: level 1 = low (long) / high (short) of the reversal candle.\nCandle body edge: level 1 = the opposite end of the reversal candle (the broken side of the rectangle).")
+minLegAtr = input.float(1.5, "Min leg size (x ATR of fib TF)", minval = 0.0, step = 0.1, group = grpS)
+minLegPct = input.float(0.05, "Min leg size (%)", minval = 0.0, step = 0.01, group = grpS)
 
 grpF = "Levels"
 entryLvl = input.float(0.5,  "Entry level (close beyond)", step = 0.01, group = grpF)
@@ -32,8 +33,7 @@ stopLvl  = input.float(0.65, "Stop level (close beyond)",  step = 0.01, group = 
 tp1Lvl   = input.float(0.0,  "TP1 – capital out", step = 0.1, group = grpF)
 tp2Lvl   = input.float(-0.6, "TP2", step = 0.1, group = grpF)
 tp3Lvl   = input.float(-1.1, "TP3 – golden / close all", step = 0.1, group = grpF)
-useHard  = input.bool(true, "Hard safety stop at level 1", group = grpF,
-     tooltip = "Protects against a single huge candle before the close-based stop can trigger.")
+useHard  = input.bool(true, "Hard safety stop at level 1", group = grpF)
 slBufT   = input.int(5, "Hard stop buffer (ticks)", minval = 0, group = grpF)
 
 grpE = "Exits"
@@ -48,134 +48,102 @@ sess     = input.session("1630-2300", "Session", group = grpT)
 sessTz   = input.string("Asia/Riyadh", "Session timezone", group = grpT)
 
 grpV = "Display"
-showFib = input.bool(true, "Draw Fibonacci + reversal zone", group = grpV)
+showFib = input.bool(true, "Draw Fibonacci of each trade", group = grpV)
 
 if timeframe.in_seconds(fibTf) < timeframe.in_seconds()
     runtime.error("Fib timeframe must be equal to or higher than the chart timeframe (use a 5m or 15m chart).")
 
-// ───────────────────────────── Swing engine (runs on fib TF) ─────────────────────────────
-// returns: direction (1 up-move / -1 down-move), fib0, fib1, zone top, zone bottom, zone time, setup id
-swingEngine(int len, bool edge) =>
+// ───────────────────────────── Leg engine (runs on fib TF) ─────────────────────────────
+// Long leg : last swing high (level 0)  -> lowest candle since then (reversal, level 1)
+// Short leg: last swing low  (level 0)  -> highest candle since then (reversal, level 1)
+legEngine(int len) =>
     ph = ta.pivothigh(high, len, len)
     pl = ta.pivotlow(low, len, len)
-    var float hiP = na
-    var float hiOther = na     // low of the pivot-high candle
-    var int   hiT = na
-    var float loP = na
-    var float loOther = na     // high of the pivot-low candle
-    var int   loT = na
-    var int   lastT = 0
-    var int   sDir = 0
-    var float s0 = na
-    var float s1 = na
-    var float zTop = na
-    var float zBot = na
-    var int   zT = na
-    var int   sid = 0
+    var float phP  = na
+    var int   phT  = na
+    var float loS  = na    // lowest low since the swing high
+    var float loOp = na    // other end of that candle (its high)
+    var int   loT  = na
+    var float plP  = na
+    var int   plT  = na
+    var float hiS  = na    // highest high since the swing low
+    var float hiOp = na    // other end of that candle (its low)
+    var int   hiT  = na
     if not na(ph)
-        if lastT == 1
-            if ph > hiP
-                hiP := ph
-                hiOther := low[len]
-                hiT := time[len]
-                if sDir == 1
-                    s0 := hiP
-                    sid += 1
-        else
-            hiP := ph
-            hiOther := low[len]
-            hiT := time[len]
-            lastT := 1
-            if not na(loP)
-                // up-move: reversal candle = pivot-low candle
-                sDir := 1
-                s0 := hiP
-                s1 := edge ? loOther : loP
-                zTop := loOther
-                zBot := loP
-                zT := loT
-                sid += 1
+        phP := ph
+        phT := time[len]
+        loS := na
+        for i = len - 1 to 0
+            if na(loS) or low[i] < loS
+                loS  := low[i]
+                loOp := high[i]
+                loT  := time[i]
+    else if not na(loS) and low < loS
+        loS  := low
+        loOp := high
+        loT  := time
     if not na(pl)
-        if lastT == -1
-            if pl < loP
-                loP := pl
-                loOther := high[len]
-                loT := time[len]
-                if sDir == -1
-                    s0 := loP
-                    sid += 1
-        else
-            loP := pl
-            loOther := high[len]
-            loT := time[len]
-            lastT := -1
-            if not na(hiP)
-                // down-move: reversal candle = pivot-high candle
-                sDir := -1
-                s0 := loP
-                s1 := edge ? hiOther : hiP
-                zTop := hiP
-                zBot := hiOther
-                zT := hiT
-                sid += 1
-    [sDir, s0, s1, zTop, zBot, zT, sid]
+        plP := pl
+        plT := time[len]
+        hiS := na
+        for i = len - 1 to 0
+            if na(hiS) or high[i] > hiS
+                hiS  := high[i]
+                hiOp := low[i]
+                hiT  := time[i]
+    else if not na(hiS) and high > hiS
+        hiS  := high
+        hiOp := low
+        hiT  := time
+    [phP, phT, loS, loOp, loT, plP, plT, hiS, hiOp, hiT, ta.atr(14)]
 
-[hDir, hF0, hF1, hZTop, hZBot, hZT, hId] = request.security(syminfo.tickerid, fibTf,
-     swingEngine(pivLen, anchor1 == "Zone edge"), lookahead = barmerge.lookahead_off)
+[phP, phT, loS, loOp, loT, plP, plT, hiS, hiOp, hiT, hAtr] = request.security(syminfo.tickerid, fibTf,
+     legEngine(pivLen), lookahead = barmerge.lookahead_off)
 
-// ───────────────────────────── Setup state (chart TF) ─────────────────────────────
-var int   setDir  = 0
-var float f0      = na
-var float f1      = na
-var int   setBar  = na
-var bool  touched = false
-var int   zoneT   = na
-var float zoneTop = na
-var float zoneBot = na
+fibAt(float a0, float a1, float x) => a0 + (a1 - a0) * x
 
-fib(x) => f0 + (f1 - f0) * x
+wick = anchor1 == "Candle wick"
 
-newSetup = not na(hId) and hId != nz(hId[1], -1)
-if newSetup and strategy.position_size == 0 and hDir != 0
-    sideOk = hDir == 1 ? hF0 > hF1 : hF1 > hF0
-    legOk = not na(hF0) and not na(hF1) and sideOk and math.abs(hF0 - hF1) / hF1 * 100 >= minLegPct
-    setDir  := legOk ? hDir : 0
-    f0      := hF0
-    f1      := hF1
-    zoneT   := hZT
-    zoneTop := hZTop
-    zoneBot := hZBot
-    setBar  := bar_index
-    touched := false
+// long leg: 0 = swing high, 1 = reversal low
+f0L  = phP
+f1L  = wick ? loS : loOp
+legL = f0L - f1L
+// short leg: 0 = swing low, 1 = reversal high
+f0S  = plP
+f1S  = wick ? hiS : hiOp
+legS = f1S - f0S
 
 inSess = not useSess or not na(time(timeframe.period, sess, sessTz))
 allowL = tradeDir != "Short only"
 allowS = tradeDir != "Long only"
 
-// pull-back to the entry level
-if setDir == 1 and low <= fib(entryLvl)
-    touched := true
-if setDir == -1 and high >= fib(entryLvl)
-    touched := true
+var int lastLegL = na
+var int lastLegS = na
 
-// invalidation before entry: closed beyond the stop level, or expired
-if strategy.position_size == 0 and setDir == 1 and (close < fib(stopLvl) or bar_index - setBar > expiryBars)
-    setDir := 0
-if strategy.position_size == 0 and setDir == -1 and (close > fib(stopLvl) or bar_index - setBar > expiryBars)
-    setDir := 0
+okL = not na(f0L) and not na(f1L) and loT > phT and legL > 0 and legL >= minLegAtr * hAtr and legL / f0L * 100 >= minLegPct and loT != nz(lastLegL, -1)
+okS = not na(f0S) and not na(f1S) and hiT > plT and legS > 0 and legS >= minLegAtr * hAtr and legS / f0S * 100 >= minLegPct and hiT != nz(lastLegS, -1)
 
-// ───────────────────────────── Entries ─────────────────────────────
-longSig  = setDir == 1  and touched and strategy.position_size == 0 and allowL and inSess and
-     close > fib(entryLvl) and close < fib(tp1Lvl)
-shortSig = setDir == -1 and touched and strategy.position_size == 0 and allowS and inSess and
-     close < fib(entryLvl) and close > fib(tp1Lvl)
+entL = fibAt(f0L, f1L, entryLvl)
+entS = fibAt(f0S, f1S, entryLvl)
 
-var float eStopC = na     // close-based stop level (0.65)
-var float eHard  = na     // hard safety stop (level 1)
+longSig  = okL and strategy.position_size == 0 and allowL and inSess and
+     close > entL and close[1] <= entL and close < fibAt(f0L, f1L, tp1Lvl)
+shortSig = okS and strategy.position_size == 0 and allowS and inSess and
+     close < entS and close[1] >= entS and close > fibAt(f0S, f1S, tp1Lvl) and not longSig
+
+// ───────────────────────────── Trade levels (frozen at entry) ─────────────────────────────
+var float e0     = na
+var float e1     = na
+var float eStopC = na
+var float eHard  = na
 var float eTP1   = na
 var float eTP2   = na
 var float eTP3   = na
 var bool  beOn   = false
+var int   dLegT  = na     // drawing anchors
+var int   dRevT  = na
+var float dRevA  = na
+var float dRevB  = na
 
 jsonMsg(string side, float px, float stp, float t1, float t2, float t3) =>
     '{"strategy":"FiboTrend","action":"' + side + '","symbol":"' + syminfo.ticker +
@@ -185,37 +153,49 @@ jsonMsg(string side, float px, float stp, float t1, float t2, float t3) =>
      ',"time":"' + str.format_time(time_close, "yyyy-MM-dd'T'HH:mm:ssZ", "UTC") + '"}'
 
 slBuf = slBufT * syminfo.mintick
+newTrade = false
 
 if longSig
-    eStopC := fib(stopLvl)
-    eHard  := fib(1.0) - slBuf
-    eTP1   := fib(tp1Lvl)
-    eTP2   := fib(tp2Lvl)
-    eTP3   := fib(tp3Lvl)
+    e0 := f0L
+    e1 := f1L
+    eHard := loS - slBuf
+    lastLegL := loT
+    dLegT := phT
+    dRevT := loT
+    dRevA := loOp
+    dRevB := loS
+    newTrade := true
+if shortSig
+    e0 := f0S
+    e1 := f1S
+    eHard := hiS + slBuf
+    lastLegS := hiT
+    dLegT := plT
+    dRevT := hiT
+    dRevA := hiS
+    dRevB := hiOp
+    newTrade := true
+
+if newTrade
+    eStopC := fibAt(e0, e1, stopLvl)
+    eTP1   := fibAt(e0, e1, tp1Lvl)
+    eTP2   := fibAt(e0, e1, tp2Lvl)
+    eTP3   := fibAt(e0, e1, tp3Lvl)
     beOn   := false
+
+if longSig
     strategy.entry("Long", strategy.long)
     alert(jsonMsg("buy", close, eStopC, eTP1, eTP2, eTP3), alert.freq_once_per_bar_close)
-    setDir := 0
-
 if shortSig
-    eStopC := fib(stopLvl)
-    eHard  := fib(1.0) + slBuf
-    eTP1   := fib(tp1Lvl)
-    eTP2   := fib(tp2Lvl)
-    eTP3   := fib(tp3Lvl)
-    beOn   := false
     strategy.entry("Short", strategy.short)
     alert(jsonMsg("sell", close, eStopC, eTP1, eTP2, eTP3), alert.freq_once_per_bar_close)
-    setDir := 0
 
 // ───────────────────────────── Exits ─────────────────────────────
-// TP1 reached -> breakeven
 if strategy.position_size > 0 and not beOn and high >= eTP1
     beOn := moveBE
 if strategy.position_size < 0 and not beOn and low <= eTP1
     beOn := moveBE
 
-// close-based stop (0.65), only while not at breakeven
 if strategy.position_size > 0 and not beOn and close < eStopC
     strategy.close("Long", comment = "SL close<0.65")
     alert(jsonMsg("close_long", close, eStopC, eTP1, eTP2, eTP3), alert.freq_once_per_bar_close)
@@ -223,29 +203,28 @@ if strategy.position_size < 0 and not beOn and close > eStopC
     strategy.close("Short", comment = "SL close>0.65")
     alert(jsonMsg("close_short", close, eStopC, eTP1, eTP2, eTP3), alert.freq_once_per_bar_close)
 
-stopL = beOn ? strategy.position_avg_price : (useHard ? eHard : na)
-stopS = beOn ? strategy.position_avg_price : (useHard ? eHard : na)
+stopX = beOn ? strategy.position_avg_price : (useHard ? eHard : na)
 
 if strategy.position_size > 0 or longSig
-    strategy.exit("L-TP1", "Long", qty_percent = q1, limit = eTP1, stop = stopL, comment_profit = "TP1 0", comment_loss = beOn ? "BE" : "Hard SL")
-    strategy.exit("L-TP2", "Long", qty_percent = q2, limit = eTP2, stop = stopL, comment_profit = "TP2 -0.6", comment_loss = beOn ? "BE" : "Hard SL")
-    strategy.exit("L-TP3", "Long", limit = eTP3, stop = stopL, comment_profit = "TP3 -1.1", comment_loss = beOn ? "BE" : "Hard SL")
+    strategy.exit("L-TP1", "Long", qty_percent = q1, limit = eTP1, stop = stopX, comment_profit = "TP1 0", comment_loss = beOn ? "BE" : "Hard SL")
+    strategy.exit("L-TP2", "Long", qty_percent = q2, limit = eTP2, stop = stopX, comment_profit = "TP2 -0.6", comment_loss = beOn ? "BE" : "Hard SL")
+    strategy.exit("L-TP3", "Long", limit = eTP3, stop = stopX, comment_profit = "TP3 -1.1", comment_loss = beOn ? "BE" : "Hard SL")
 
 if strategy.position_size < 0 or shortSig
-    strategy.exit("S-TP1", "Short", qty_percent = q1, limit = eTP1, stop = stopS, comment_profit = "TP1 0", comment_loss = beOn ? "BE" : "Hard SL")
-    strategy.exit("S-TP2", "Short", qty_percent = q2, limit = eTP2, stop = stopS, comment_profit = "TP2 -0.6", comment_loss = beOn ? "BE" : "Hard SL")
-    strategy.exit("S-TP3", "Short", limit = eTP3, stop = stopS, comment_profit = "TP3 -1.1", comment_loss = beOn ? "BE" : "Hard SL")
+    strategy.exit("S-TP1", "Short", qty_percent = q1, limit = eTP1, stop = stopX, comment_profit = "TP1 0", comment_loss = beOn ? "BE" : "Hard SL")
+    strategy.exit("S-TP2", "Short", qty_percent = q2, limit = eTP2, stop = stopX, comment_profit = "TP2 -0.6", comment_loss = beOn ? "BE" : "Hard SL")
+    strategy.exit("S-TP3", "Short", limit = eTP3, stop = stopX, comment_profit = "TP3 -1.1", comment_loss = beOn ? "BE" : "Hard SL")
 
 // ───────────────────────────── Drawing ─────────────────────────────
 var array<line>  fLines  = array.new<line>()
 var array<label> fLabels = array.new<label>()
-var box zoneBox = na
+var box revBox = na
 lvls = array.from(1.0, stopLvl, entryLvl, tp1Lvl, tp2Lvl, tp3Lvl, -1.6, -1.9)
 
 lvlColor(int i) =>
     switch i
-        0 => color.gray
-        1 => color.red
+        0 => color.red
+        1 => color.green
         2 => color.green
         3 => color.gray
         4 => color.aqua
@@ -253,29 +232,28 @@ lvlColor(int i) =>
         6 => color.fuchsia
         => color.blue
 
-if showFib and newSetup and setDir != 0
+if showFib and newTrade
     for l in fLines
         line.delete(l)
     for lb in fLabels
         label.delete(lb)
     array.clear(fLines)
     array.clear(fLabels)
-    box.delete(zoneBox)
-    zoneBox := box.new(zoneT, zoneTop, time, zoneBot, xloc = xloc.bar_time,
-         border_color = color.new(color.red, 60), bgcolor = color.new(setDir == -1 ? color.red : color.green, 85))
+    box.delete(revBox)
+    revBox := box.new(dRevT, math.max(dRevA, dRevB), dRevT + timeframe.in_seconds(fibTf) * 1000, math.min(dRevA, dRevB),
+         xloc = xloc.bar_time, border_color = color.new(color.red, 40), bgcolor = color.new(color.red, 80))
     for [i, x] in lvls
-        y = fib(x)
-        fLines.push(line.new(zoneT, y, time, y, xloc = xloc.bar_time, color = lvlColor(i)))
+        y = fibAt(e0, e1, x)
+        fLines.push(line.new(dLegT, y, time, y, xloc = xloc.bar_time, color = lvlColor(i)))
         fLabels.push(label.new(time, y, str.tostring(x) + " (" + str.tostring(y, format.mintick) + ")",
              xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.white, 100),
              textcolor = lvlColor(i), size = size.small))
 
-if showFib and array.size(fLines) > 0 and (setDir != 0 or strategy.position_size != 0)
+if showFib and strategy.position_size != 0 and array.size(fLines) > 0
     for l in fLines
         line.set_x2(l, time)
     for lb in fLabels
         label.set_x(lb, time)
-    box.set_right(zoneBox, time)
 
 plotshape(longSig,  "Buy",  shape.triangleup,   location.belowbar, color.green, size = size.small)
 plotshape(shortSig, "Sell", shape.triangledown, location.abovebar, color.red,   size = size.small)
