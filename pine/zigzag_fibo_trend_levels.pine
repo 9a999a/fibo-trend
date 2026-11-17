@@ -3,8 +3,8 @@
 // Modified: levels replaced with the Fibo Trend strategy levels (1 / 0.65 / 0.5 / 0 / -0.6 / -1.1 / -1.6 / -1.9)
 
 //@version=4
-study("ZigZag Fibo Trend Levels", overlay = true, max_bars_back = 500, max_lines_count = 300, max_labels_count = 300)
-prd = input(defval = 15, title="ZigZag Period", minval = 2, maxval = 50)
+study("ZigZag Fibo Trend Levels", overlay = true, max_bars_back = 2000, max_lines_count = 300, max_labels_count = 300)
+prd = input(defval = 15, title="ZigZag Period", minval = 2, maxval = 1000)
 showzigzag = input(defval = true, title = "Show Zig Zag")
 showfibo = input(defval = true, title = "Show Fibonacci Levels")
 upcol = input(defval = color.lime, title = "Zigzag Colors", inline = "zzcol")
